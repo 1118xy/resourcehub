@@ -1,0 +1,16 @@
+
+Enter file contents here
+{
+  "name": "resourcehub-server",
+  "version": "1.2.18",
+  "description": "资源上传平台 - 后端服务器（零依赖 Node.js）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true,
+  "license": "UNLICENSED"
+}
