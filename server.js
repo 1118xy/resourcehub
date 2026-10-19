@@ -20,6 +20,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const tls = require('tls');
 
 // ===================== 配置 =====================
 const PORT = process.env.PORT || 3000;
@@ -27,7 +28,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.SECRET || 'resource-hub-secret-2026';
 const DATA_DIR = path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const MAX_FILE_SIZE = 200 * 1024 * 1024;      // 单文件 200MB
+const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024;   // 单文件 2GB（免费用户；作者不受此限）
 const DAILY_UPLOAD_LIMIT = 5;                  // 普通用户每人每天上传上限
 const VIP_DAILY_UPLOAD_LIMIT = 20;             // 会员每人每天上传上限
 const VIP_DAY_MS = 24 * 3600 * 1000;           // 会员券 = 1 天会员使用权
@@ -64,8 +65,13 @@ const ALLOWED_EXT = new Set([
   'mp4', 'mp3', 'jpg', 'jpeg', 'png', 'gif', 'js', 'bat', 'sh',
   'csv', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'json', 'md',
   // 视频 / 音频 / 录音
-  'm4v', 'avi', 'mkv', 'mov', 'wmv', 'webm', '3gp', 'flv', 'ts',
-  'm4a', 'wav', 'aac', 'amr', 'ogg', 'flac', 'opus', 'mid', 'midi',
+  'm4v', 'avi', 'mkv', 'mov', 'wmv', 'webm', '3gp', 'flv', 'ts', 'mpg', 'mpeg', 'vob', 'rm', 'rmvb', 'swf',
+  'm4a', 'wav', 'aac', 'amr', 'ogg', 'flac', 'opus', 'mid', 'midi', 'wma', 'ra',
+  // 图片 / 设计 / 文档 / 其他常用文件（什么文件都可以传）
+  'webp', 'svg', 'bmp', 'ico', 'tif', 'tiff', 'heic', 'heif', 'psd', 'ai', 'cdr', 'dwg',
+  'ttf', 'otf', 'woff', 'woff2', 'eot', 'lrc', 'srt', 'ass', 'sub',
+  'bak', 'dat', 'db', 'sql', 'log', 'ini', 'cfg', 'conf', 'yaml', 'yml', 'toml',
+  'torrent', 'iso', 'img', 'dmg', 'vhd', 'epub', 'mobi', 'azw3', 'chm', 'djvu', 'caj',
 ]);
 
 // 危险权限特征（APK 启发式）
@@ -115,6 +121,13 @@ const messagesFile = path.join(DATA_DIR, 'messages.json');
 const rechargesFile = path.join(DATA_DIR, 'recharges.json');
 const scansFile = path.join(DATA_DIR, 'scan_sessions.json');
 const cardsFile = path.join(DATA_DIR, 'cards.json');       // 会员卡密库 { "XS-XXXX-...": { plan, used, usedBy, usedAt } }
+const groupFile = path.join(DATA_DIR, 'group_messages.json'); // 群聊消息（公共群）
+const groupsFile = path.join(DATA_DIR, 'groups.json'); // 用户自建群（多群：创建/按编号加入/加朋友）
+let groups = loadJson(groupsFile, []);
+const backupsFile = path.join(DATA_DIR, 'backups.json'); // 用户自动备份 { userId: { lastAt, phone, authorNo, nickname, vipTag, favCount, upCount } }
+let backups = loadJson(backupsFile, {});
+const updateFile = path.join(DATA_DIR, 'update.json');  // 远程更新配置 { version, log, link, notice } 作者可随时改
+let updateCfg = loadJson(updateFile, {});
 
 let users = loadJson(usersFile, []);
 let resources = loadJson(resFile, []);
@@ -124,6 +137,7 @@ let messages = loadJson(messagesFile, []);    // [{ id, from, fromName, to, cont
 let recharges = loadJson(rechargesFile, []);  // 会员充值核验申请
 let scanSessions = loadJson(scansFile, {});   // { code: { uid, vcode, exp } }
 let cards = loadJson(cardsFile, {});          // 会员卡密库
+let groupMsgs = loadJson(groupFile, []);      // 群聊 [{ id, authorId, authorNo, authorName, content, createdAt }]
 
 function persistAll() {
   saveJson(usersFile, users);
@@ -134,6 +148,8 @@ function persistAll() {
   saveJson(rechargesFile, recharges);
   saveJson(scansFile, scanSessions);
   saveJson(cardsFile, cards);
+  saveJson(groupFile, groupMsgs);
+  saveJson(backupsFile, backups);
 }
 
 /** 自动备份：把全部数据打包成一份 data.json，每天一个备份目录，保留最近 30 天 */
@@ -166,6 +182,26 @@ function backupNow() {
     console.error('[自动备份失败]', e.message);
     return false;
   }
+}
+
+/** 用户级自动备份：每次登录/操作后把账号关键信息存到 backups.json，供用户查看 */
+function autoBackup(u) {
+  if (!u || !u.id) return;
+  try {
+    backups[u.id] = {
+      lastAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      phone: maskPhone(u.phone || ''),
+      authorNo: u.authorNo || '',
+      nickname: u.nickname || '',
+      vipTag: u.vipTag || (u.vipPlan ? '会员' : '普通用户'),
+      favCount: (u.favs || []).length,
+      upCount: (u.uploadCount || 0),
+    };
+    saveJson(backupsFile, backups);
+  } catch (e) { console.error('[用户备份失败]', e.message); }
+}
+function maskPhone(p) {
+  return p && p.length === 11 ? p.slice(0, 3) + '****' + p.slice(7) : p;
 }
 
 // ===================== 工具函数 =====================
@@ -210,7 +246,13 @@ function isVip(u) {
 function vipExpireAt(u) {
   return isVip(u) ? u.vipUntil : '';
 }
+/** 是否平台作者（001=作者，免费无限上传，云盘不限） */
+function isAuthor(u) {
+  return u && u.authorNo === '001';
+}
+const QUOTA_AUTHOR = 100 * 1024 * 1024 * 1024 * 1024; // 作者云盘 100TB（视为不限）
 function dailyLimitFor(u) {
+  if (isAuthor(u)) return 99999;             // 作者免费：每天可传 99999 个（视为不限）
   return isVip(u) ? VIP_DAILY_UPLOAD_LIMIT : DAILY_UPLOAD_LIMIT;
 }
 function unusedCoupons(u) {
@@ -227,8 +269,9 @@ function ensureVipFields(u) {
 function storageUsed(userId) {
   return resources.filter((r) => r.authorId === userId).reduce((a, r) => a + (r.size || 0), 0);
 }
-/** 云盘配额：免费 1GB；小善专属VIP·基础 5GB；VIP·高级 100GB（旧会员兼容 100GB） */
+/** 云盘配额：作者 100TB（不限）；免费 1GB；小善专属VIP·基础 5GB；VIP·高级 100GB（旧会员兼容 100GB） */
 function quotaFor(u) {
+  if (isAuthor(u)) return QUOTA_AUTHOR;
   if (!isVip(u)) return QUOTA_FREE;
   const plan = VIP_PLANS[u.vipPlan] || VIP_PLANS.pro;
   return plan.storageGB * 1024 * 1024 * 1024;
@@ -264,6 +307,8 @@ function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 function fmtSize(n) {
+  if (n >= 1125899906842624) return (n / 1125899906842624).toFixed(2) + ' PB';
+  if (n >= 1099511627776) return (n / 1099511627776).toFixed(2) + ' TB';
   if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
   if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
   if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
@@ -403,6 +448,439 @@ function scanFile(fileName, size, buffer) {
   return { status: 'safe', reason: '扫描通过', report: ['未发现病毒或危险特征，安全'] };
 }
 
+// ===================== QQ 邮箱验证码登录（SMTP 发信） =====================
+// 使用前需配置发信邮箱 + SMTP 授权码（QQ邮箱网页版 → 设置 → 账户 → 开启SMTP服务 → 生成授权码）
+// 可通过环境变量 QMAIL_USER / QMAIL_PASS 注入，未配置时接口返回明确提示
+const EMAIL_SMTP = {
+  host: 'smtp.qq.com',
+  port: 465,
+  user: process.env.QMAIL_USER || '',
+  pass: process.env.QMAIL_PASS || '',
+};
+// 邮箱验证码：email → { code, exp }，5 分钟有效（内存存储）
+const emailCodes = new Map();
+
+// 手写 SMTP 客户端（QQ 邮箱 465 隐式 TLS），不依赖第三方库
+const smtpSend = (to, subject, html) =>
+  new Promise((resolve, reject) => {
+    const { user, pass, host, port } = EMAIL_SMTP;
+    if (!user || !pass) return reject(new Error('QQ邮箱SMTP未配置：请提供发信邮箱和授权码'));
+    const sock = tls.connect({ host, port, servername: host }, () => {
+      const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+      const cmds = [
+        ['EHLO resourcehub\r\n', 250],
+        ['AUTH LOGIN\r\n', 334],
+        [b64(user) + '\r\n', 334],
+        [b64(pass) + '\r\n', 235],
+        ['MAIL FROM:<' + user + '>\r\n', 250],
+        ['RCPT TO:<' + to + '>\r\n', 250],
+        ['DATA\r\n', 354],
+        ['From: 资源上传平台 <' + user + '>\r\nTo: <' + to + '>\r\nSubject: =?UTF-8?B?' + Buffer.from(subject).toString('base64') + '?=\r\nContent-Type: text/html; charset=UTF-8\r\nMIME-Version: 1.0\r\n\r\n' + html + '\r\n.\r\n', 250],
+        ['QUIT\r\n', 221],
+      ];
+      let i = 0, buf = '';
+      const next = () => {
+        if (i >= cmds.length) { sock.end(); resolve(); return; }
+        sock.write(cmds[i][0]);
+        const expect = cmds[i][1];
+        const onData = (d) => {
+          buf += d.toString();
+          const m = buf.match(/^(\d{3})[ -]/m);
+          if (!m) return;
+          const code = parseInt(m[1], 10);
+          if (code === expect) {
+            buf = '';
+            i++;
+            sock.removeListener('data', onData);
+            if (i < cmds.length) next();
+            else { sock.end(); resolve(); }
+          } else {
+            sock.removeListener('data', onData);
+            sock.destroy();
+            reject(new Error('SMTP 错误：期望 ' + expect + ' 收到 ' + code + '：' + buf.slice(0, 200)));
+          }
+        };
+        sock.on('data', onData);
+      };
+      const first = (d) => {
+        buf += d.toString();
+        if (buf.match(/^220/)) { sock.removeListener('data', first); next(); }
+      };
+      sock.on('data', first);
+      sock.setTimeout(20000, () => { sock.destroy(); reject(new Error('SMTP 超时')); });
+    });
+    sock.on('error', (e) => reject(e));
+  });
+
+// ===================== 网页版首页（登录后：资源广场 + 站内消息，其余功能跳转 App） =====================
+const WEB_HOME = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>资源上传平台 · 网页版</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#0A0E1A; color:#E6EAF2; min-height:100vh; }
+  header { padding:26px 18px 14px; text-align:center;
+           background:linear-gradient(160deg,#0E1730 0%,#132A52 100%); }
+  header h1 { font-size:21px; letter-spacing:1px; }
+  header .sub { margin-top:5px; font-size:12px; color:#8FA3C8; }
+  .login-wrap { max-width:440px; margin:0 auto; padding:18px 14px 90px; }
+  .lg-card { background:#101A33; border:1px solid #1C2B4D; border-radius:14px; padding:16px; margin-bottom:12px; }
+  .lg-card h3 { font-size:15px; margin-bottom:12px; color:#33E6FF; }
+  .lg-card input { width:100%; padding:11px 12px; border-radius:10px; border:1px solid #1C2B4D;
+    background:#0E1730; color:#E6EAF2; font-size:14px; outline:none; margin-bottom:10px; }
+  .row2 { display:flex; gap:8px; }
+  .row2 input { flex:1; }
+  .btn { border:none; border-radius:10px; padding:12px; font-size:15px; font-weight:700; cursor:pointer;
+         color:#fff; background:linear-gradient(90deg,#22A6FF,#00E5C8); width:100%; }
+  .btn.small { padding:10px 0; font-size:13px; width:auto; flex:0 0 auto; margin-bottom:10px; }
+  .btn.ghost { background:transparent; border:1px solid #33E6FF; color:#33E6FF; }
+  .hint { font-size:11px; color:#8FA3C8; text-align:center; margin-top:8px; line-height:1.7; }
+  .scancode { background:#132A52; border:1px dashed #33E6FF; border-radius:10px; padding:12px;
+              text-align:center; font-size:13px; line-height:1.8; margin-bottom:10px; }
+  .scancode b { color:#33E6FF; font-size:16px; letter-spacing:2px; }
+  nav { display:flex; background:#0E1730; border-bottom:1px solid #1C2B4D; }
+  nav button { flex:1; padding:13px 0; background:transparent; border:none; color:#8FA3C8;
+               font-size:15px; cursor:pointer; border-bottom:2px solid transparent; }
+  nav button.on { color:#33E6FF; border-bottom-color:#33E6FF; font-weight:700; }
+  .topbar { display:flex; align-items:center; justify-content:space-between; max-width:760px;
+            margin:0 auto; padding:12px 14px 0; }
+  .topbar .who { font-size:14px; color:#8FA3C8; }
+  .topbar .who b { color:#33E6FF; }
+  .topbar button { background:transparent; border:1px solid #1C2B4D; color:#8FA3C8; border-radius:8px;
+                   padding:6px 12px; font-size:12px; cursor:pointer; }
+  main { max-width:760px; margin:0 auto; padding:14px 14px 90px; }
+  .toolbar { display:flex; gap:8px; margin-bottom:12px; }
+  .toolbar input, .toolbar select { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #1C2B4D;
+    background:#0E1730; color:#E6EAF2; font-size:14px; outline:none; }
+  .toolbar select { flex:0 0 auto; }
+  .card { background:#101A33; border:1px solid #1C2B4D; border-radius:14px; padding:13px;
+          margin-bottom:10px; display:flex; gap:12px; align-items:center; }
+  .ficon { width:44px; height:44px; border-radius:12px; flex:0 0 auto;
+           background:linear-gradient(135deg,#33E6FF,#1677FF); display:flex; align-items:center;
+           justify-content:center; font-weight:800; color:#fff; font-size:11px; }
+  .info { flex:1; min-width:0; }
+  .info .t { font-size:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .info .m { margin-top:4px; font-size:11px; color:#8FA3C8; line-height:1.6;
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .btn.act { width:auto; padding:9px 13px; font-size:12px; flex:0 0 auto; }
+  .empty { text-align:center; color:#5A6B8F; padding:40px 0; font-size:14px; }
+  .box { background:#101A33; border:1px solid #1C2B4D; border-radius:14px; padding:15px; margin-bottom:12px; }
+  .box h3 { font-size:15px; margin-bottom:11px; color:#33E6FF; }
+  .box input, .box textarea { width:100%; padding:11px 12px; border-radius:10px; border:1px solid #1C2B4D;
+    background:#0E1730; color:#E6EAF2; font-size:14px; outline:none; margin-bottom:10px; }
+  .box textarea { min-height:64px; resize:vertical; }
+  .msg { padding:10px; border-radius:10px; background:#0E1730; margin-bottom:8px; font-size:13px; line-height:1.6; }
+  .msg .from { color:#33E6FF; font-weight:700; }
+  .msg .time { float:right; color:#5A6B8F; font-size:11px; }
+  .msg.unread { border-left:3px solid #FF8F1F; }
+  .mi { display:flex; align-items:center; justify-content:space-between; padding:13px 4px;
+        border-bottom:1px solid #16224A; font-size:14px; }
+  .mi:last-child { border-bottom:none; }
+  .mi .lbl { color:#C7D3EA; }
+  .mi .val { color:#5A6B8F; font-size:12px; }
+  .mi .go { color:#33E6FF; font-size:12px; }
+  .dl-tip { background:#132A52; border:1px solid #1C2B4D; border-radius:10px; padding:10px;
+            font-size:12px; color:#8FA3C8; line-height:1.7; margin-bottom:12px; }
+  footer { position:fixed; bottom:0; left:0; right:0; background:#0A0E1A; text-align:center;
+           padding:10px; font-size:11px; color:#5A6B8F; border-top:1px solid #1C2B4D; }
+  .err { color:#FF7A7A; font-size:12px; margin-bottom:10px; text-align:center; min-height:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📦 资源上传平台</h1>
+  <p class="sub">公开 · 永久免费 · 登录后可看资源 / 聊天，下载需打开 App</p>
+</header>
+
+<!-- 登录页 -->
+<div id="page-login" class="login-wrap">
+  <div class="lg-card">
+    <h3>📱 手机号密码登录</h3>
+    <input id="lg-acc" placeholder="手机号">
+    <input id="lg-pwd" type="password" placeholder="密码">
+    <div class="err" id="err-phone"></div>
+    <button class="btn" id="lg-btn">登 录</button>
+  </div>
+  <div class="lg-card">
+    <h3>✉️ QQ 邮箱验证码登录</h3>
+    <input id="qmail" placeholder="QQ 邮箱（如 123456@qq.com）">
+    <div class="row2">
+      <input id="qcode" placeholder="6 位验证码">
+      <button class="btn small" id="qsend">获取验证码</button>
+    </div>
+    <div class="err" id="err-qmail"></div>
+    <button class="btn" id="qmail-btn">验证码登录</button>
+  </div>
+  <div class="lg-card">
+    <h3>📲 App 扫码登录</h3>
+    <div class="scancode" id="scan-box">生成中…</div>
+    <button class="btn" id="scan-btn">打开 App 确认登录</button>
+    <button class="btn ghost" style="margin-top:8px" onclick="location.href='/app.apk'">未装 App？点此下载安装</button>
+    <p class="hint" style="margin-top:10px">点「打开 App 确认登录」会跳转 App；未安装则先点下方按钮下载 App</p>
+  </div>
+  <p class="hint">没有账号？请先下载「资源上传平台」App 注册登录<br>
+  加入 QQ 群 1123 · 客服 QQ：1218742069</p>
+</div>
+
+<!-- 登录后主界面 -->
+<div id="page-main" hidden>
+  <div class="topbar">
+    <span class="who">你好，<b id="me-name"></b><span id="me-no"></span></span>
+    <button id="logout-btn">退出登录</button>
+  </div>
+  <nav>
+    <button id="nav-res" class="on">资源广场</button>
+    <button id="nav-msg">我的消息</button>
+    <button id="nav-me">我的</button>
+  </nav>
+  <main>
+    <section id="tab-res">
+      <div class="toolbar">
+        <input id="q" placeholder="搜索资源 / 作者">
+        <select id="type">
+          <option value="">全部</option>
+          <option>apk</option><option>exe</option><option>zip</option><option>rar</option>
+          <option>pdf</option><option>doc</option><option>xls</option><option>ppt</option>
+          <option>txt</option><option>mp4</option><option>mp3</option><option>jpg</option>
+          <option>png</option><option>html</option><option>other</option>
+        </select>
+      </div>
+      <div class="dl-tip">🔒 网页版可看资源信息；<b>下载文件需在 App 内查看</b>。会员、云盘、上传等请在 App 操作。<br>📲 <a href="/app.apk" style="color:#33E6FF">未安装 App？点此下载安装包</a>（永久链接）</div>
+      <div id="res-list">加载中…</div>
+    </section>
+    <section id="tab-msg" hidden>
+      <div class="box">
+        <h3>📥 收件箱</h3>
+        <div id="inbox">加载中…</div>
+      </div>
+      <div class="box">
+        <h3>✉️ 发消息（收件人填作者编号，如 001）</h3>
+        <input id="to-no" placeholder="作者编号（001 / 002 …）">
+        <textarea id="msg-content" placeholder="消息内容（1-500 字）"></textarea>
+        <button class="btn" id="send-btn">发送</button>
+      </div>
+    </section>
+    <section id="tab-me" hidden>
+      <div class="box">
+        <h3>👤 我的资料</h3>
+        <div class="mi"><span class="lbl">昵称</span><span class="val" id="me-nick"></span></div>
+        <div class="mi"><span class="lbl">作者编号</span><span class="val" id="me-author"></span></div>
+        <div class="mi"><span class="lbl">账号</span><span class="val" id="me-acc"></span></div>
+      </div>
+      <div class="box">
+        <h3>⚙️ 更多功能（需在 App 内操作）</h3>
+        <div class="mi"><span class="lbl">小善专属VIP · 会员</span><span class="go" onclick="openApp('member')">在 App 查看 →</span></div>
+        <div class="mi"><span class="lbl">云盘空间 / 上传文件</span><span class="go" onclick="openApp('cloud')">在 App 操作 →</span></div>
+        <div class="mi"><span class="lbl">下载记录 / 我的上传</span><span class="go" onclick="openApp('mine')">在 App 查看 →</span></div>
+        <div class="mi"><span class="lbl">签到 / 会员券 / 卡密</span><span class="go" onclick="openApp('vip')">在 App 操作 →</span></div>
+        <div class="mi"><span class="lbl">设置 / 主题 / 反馈</span><span class="go" onclick="openApp('settings')">在 App 打开 →</span></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>资源上传平台 · 服务器 http://131292rj7lw33.vicp.fun · v1.2.14 · 客服QQ 1218742069</footer>
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var token = localStorage.getItem('hsk_token') || '';
+  var fmt = function(n){
+    if(n>=1073741824) return (n/1073741824).toFixed(2)+' GB';
+    if(n>=1048576) return (n/1048576).toFixed(1)+' MB';
+    if(n>=1024) return (n/1024).toFixed(1)+' KB';
+    return n+' B';
+  };
+  var esc = function(s){ return String(s||'').replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
+  var api = function(path, opt){
+    opt = opt || {};
+    var headers = opt.headers || {};
+    if(token) headers['X-Token'] = token;
+    if(opt.body) headers['Content-Type'] = 'application/json';
+    return fetch(path, { method: opt.method || 'GET', headers: headers,
+      body: opt.body ? JSON.stringify(opt.body) : undefined });
+  };
+  var openApp = function(page){
+    try { location.href = 'resourcehub://' + (page || ''); } catch(e){}
+    setTimeout(function(){
+      if(confirm('如果手机已安装「资源上传平台」App 会自动打开；\n未安装则点击「确定」跳转下载安装包（或点「取消」继续浏览网页版）。')){
+        location.href = '/app.apk';
+      }
+    }, 600);
+  };
+  // ---------- 登录态 ----------
+  function afterLogin(d){
+    token = d.token;
+    localStorage.setItem('hsk_token', token);
+    localStorage.setItem('hsk_me', JSON.stringify(d.user || {}));
+    showMain(d.user);
+  }
+  function showMain(u){
+    $('page-login').hidden = true;
+    $('page-main').hidden = false;
+    $('me-name').textContent = esc(u.nickname || '用户');
+    $('me-no').textContent = ' #' + esc(u.authorNo || '');
+    $('me-nick').textContent = esc(u.nickname || '');
+    $('me-author').textContent = '#' + esc(u.authorNo || '');
+    $('me-acc').textContent = esc(u.phone || u.email || '第三方账号');
+    loadRes();
+  }
+  // ---------- ① 手机号密码登录 ----------
+  $('lg-btn').addEventListener('click', function(){
+    var acc = $('lg-acc').value.trim(), pwd = $('lg-pwd').value;
+    if(!acc || !pwd){ $('err-phone').textContent = '请输入账号和密码'; return; }
+    $('err-phone').textContent = '';
+    $('lg-btn').disabled = true; $('lg-btn').textContent = '登录中…';
+    api('/api/login', { method:'POST', body:{ account: acc, password: pwd,
+      mode: acc.indexOf('@')>=0 ? 'email' : 'phone' } })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        $('lg-btn').disabled = false; $('lg-btn').textContent = '登 录';
+        if(!d.token){ $('err-phone').textContent = d.error || '登录失败'; return; }
+        afterLogin(d);
+      }).catch(function(){ $('lg-btn').disabled=false; $('lg-btn').textContent='登 录';
+        $('err-phone').textContent = '网络错误，请重试'; });
+  });
+  // ---------- ② QQ 邮箱验证码登录 ----------
+  $('qsend').addEventListener('click', function(){
+    var email = $('qmail').value.trim();
+    if(!/^[\w.+-]+@(qq|foxmail)\.com$/.test(email)){ $('err-qmail').textContent = '请输入 QQ 邮箱'; return; }
+    $('err-qmail').textContent = '';
+    $('qsend').disabled = true; $('qsend').textContent = '发送中…';
+    api('/api/qmail/code', { method:'POST', body:{ email: email } })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        $('qsend').disabled = false; $('qsend').textContent = '获取验证码';
+        if(d.ok){ $('err-qmail').textContent = '验证码已发送到 ' + email + '（5 分钟内有效）'; }
+        else $('err-qmail').textContent = d.error || '发送失败';
+      }).catch(function(){ $('qsend').disabled=false; $('qsend').textContent='获取验证码';
+        $('err-qmail').textContent = '网络错误，请重试'; });
+  });
+  $('qmail-btn').addEventListener('click', function(){
+    var email = $('qmail').value.trim(), code = $('qcode').value.trim();
+    if(!email || !code){ $('err-qmail').textContent = '请填写邮箱和验证码'; return; }
+    $('err-qmail').textContent = '';
+    $('qmail-btn').disabled = true; $('qmail-btn').textContent = '登录中…';
+    api('/api/qmail/login', { method:'POST', body:{ email: email, code: code } })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        $('qmail-btn').disabled = false; $('qmail-btn').textContent = '验证码登录';
+        if(!d.token){ $('err-qmail').textContent = d.error || '登录失败'; return; }
+        afterLogin(d);
+      }).catch(function(){ $('qmail-btn').disabled=false; $('qmail-btn').textContent='验证码登录';
+        $('err-qmail').textContent = '网络错误，请重试'; });
+  });
+  // ---------- ③ App 扫码登录 ----------
+  var scanSid = '', scanVcode = '', scanTimer = null;
+  function startScan(){
+    api('/api/scan/anonymous', { method:'POST', body:{} })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(!d.sid){ $('scan-box').textContent = '生成失败，请刷新'; return; }
+        scanSid = d.sid; scanVcode = d.vcode;
+        $('scan-box').innerHTML = '登录码：<b>' + esc(d.sid) + '</b><br>验证码：<b>' + esc(d.vcode) + '</b><br><span style="font-size:11px;color:#5A6B8F">' + esc(d.url) + '</span>';
+        clearInterval(scanTimer);
+        scanTimer = setInterval(function(){
+          api('/api/scan/poll?sid=' + scanSid)
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if(d.status === 'ok'){
+                clearInterval(scanTimer);
+                afterLogin(d);
+              }
+            }).catch(function(){});
+        }, 2500);
+      }).catch(function(){ $('scan-box').textContent = '生成失败，请刷新'; });
+  }
+  $('scan-btn').addEventListener('click', function(){
+    if(!scanSid){ startScan(); }
+    location.href = 'resourcehub://scanlogin?sid=' + scanSid;
+  });
+  startScan();
+  // ---------- 资源广场 ----------
+  function loadRes(){
+    var q = encodeURIComponent($('q').value.trim());
+    var t = $('type').value;
+    api('/api/resources?page=1&pageSize=50&q=' + q + (t ? '&type=' + t : ''))
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(!d.items || !d.items.length){ $('res-list').innerHTML = '<div class="empty">暂无资源</div>'; return; }
+        $('res-list').innerHTML = d.items.map(function(r){
+          var icon = (r.fileType||'file').toUpperCase().slice(0,4);
+          return '<div class="card">' +
+            '<div class="ficon">' + esc(icon) + '</div>' +
+            '<div class="info"><div class="t">' + esc(r.title) + '</div>' +
+            '<div class="m">' + esc(r.fileName) + ' · ' + fmt(r.size) + ' · 作者 #' + esc(r.authorNo) + ' ' + esc(r.authorName) +
+            ' · 下载 ' + (r.downloads||0) + ' 次 · ' + esc((r.createdAt||'').slice(0,10)) + '</div></div>' +
+            '<button class="btn act" onclick="openApp(\'resource?id=' + esc(r.id) + '\')">在 App 打开</button>' +
+            '</div>';
+        }).join('');
+      }).catch(function(){ $('res-list').innerHTML = '<div class="empty">加载失败，请刷新重试</div>'; });
+  }
+  $('q').addEventListener('input', function(){ clearTimeout(window._t); window._t = setTimeout(loadRes, 300); });
+  $('type').addEventListener('change', loadRes);
+  // ---------- 消息 ----------
+  function loadMsg(){
+    api('/api/messages')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(!d.ok){ $('inbox').innerHTML = '<div class="empty">请先登录</div>'; return; }
+        if(!d.messages.length){ $('inbox').innerHTML = '<div class="empty">暂无消息</div>'; return; }
+        $('inbox').innerHTML = d.messages.map(function(m){
+          return '<div class="msg' + (m.read ? '' : ' unread') + '"><span class="time">' + esc((m.time||'').slice(0,16).replace('T',' ')) + '</span>' +
+            '<span class="from">' + esc(m.fromName || '#') + '（#' + esc(m.fromAuthorNo||'') + '）</span>：' + esc(m.content) + '</div>';
+        }).join('');
+      }).catch(function(){ $('inbox').innerHTML = '<div class="empty">加载失败</div>'; });
+  }
+  $('send-btn').addEventListener('click', function(){
+    var to = $('to-no').value.trim(), content = $('msg-content').value.trim();
+    if(!/^\\d{3}$/.test(to)){ alert('作者编号格式错误（如 001）'); return; }
+    if(!content){ alert('请输入消息内容'); return; }
+    $('send-btn').disabled = true;
+    api('/api/message/send', { method:'POST', body:{ to: to, content: content } })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        $('send-btn').disabled = false;
+        if(d.ok){ alert('消息已发送'); $('msg-content').value=''; loadMsg(); }
+        else alert(d.error || '发送失败');
+      }).catch(function(){ $('send-btn').disabled=false; alert('网络错误，请重试'); });
+  });
+  // ---------- Tab 切换 / 退出 ----------
+  $('nav-res').addEventListener('click', function(){ tab('res'); });
+  $('nav-msg').addEventListener('click', function(){ tab('msg'); loadMsg(); });
+  $('nav-me').addEventListener('click', function(){ tab('me'); });
+  function tab(name){
+    $('nav-res').className = name==='res' ? 'on' : '';
+    $('nav-msg').className = name==='msg' ? 'on' : '';
+    $('nav-me').className = name==='me' ? 'on' : '';
+    $('tab-res').hidden = name!=='res';
+    $('tab-msg').hidden = name!=='msg';
+    $('tab-me').hidden = name!=='me';
+  }
+  $('logout-btn').addEventListener('click', function(){
+    token = '';
+    localStorage.removeItem('hsk_token');
+    localStorage.removeItem('hsk_me');
+    location.reload();
+  });
+  // ---------- 启动 ----------
+  if(token){
+    api('/api/me')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(d.user){ showMain(d.user); }
+        else { token=''; localStorage.removeItem('hsk_token'); location.reload(); }
+      }).catch(function(){});
+  }
+})();
+</script>
+</body>
+</html>`;
+
 // ===================== HTTP 服务器 =====================
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -431,6 +909,27 @@ const server = http.createServer(async (req, res) => {
   };
 
   try {
+    // ---------- APK 安装包下载（网页版跳转下载链接用，永久有效） ----------
+    if (method === 'GET' && (p === '/app.apk' || p === '/download')) {
+      const apkPath = path.join(__dirname, 'app.apk');
+      if (!fs.existsSync(apkPath)) return send(404, { error: '安装包不存在' });
+      const stat = fs.statSync(apkPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Length': stat.size,
+        'Content-Disposition': 'attachment; filename="resourcehub_v1.2.14.apk"',
+      });
+      fs.createReadStream(apkPath).pipe(res);
+      return;
+    }
+
+    // ---------- 网页版首页（资源广场 + 站内消息，下载跳转 App） ----------
+    if (method === 'GET' && (p === '/' || p === '/web/')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(WEB_HOME);
+      return;
+    }
+
     // ---------- 健康检查 ----------
     if (method === 'GET' && p === '/api/health') {
       return send(200, { ok: true, time: new Date().toISOString(), version: '1.0.0', dailyLimit: DAILY_UPLOAD_LIMIT });
@@ -455,6 +954,72 @@ const server = http.createServer(async (req, res) => {
         serverTime: new Date().toISOString(),
         uptimeSec: Math.floor(process.uptime()),
       });
+    }
+
+    // ---------- 自动备份：查看备份信息 ----------
+    if (method === 'GET' && p === '/api/backup/info') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const bk = backups[me.id];
+      return send(200, {
+        ok: true,
+        count: bk ? 1 : 0,
+        info: bk ? ('最近备份：' + bk.lastAt + '\n备份项：手机号、编号、昵称、会员、收藏、上传记录') : '暂无备份数据，登录后自动备份',
+      });
+    }
+
+    // ---------- 自动备份：查看备份内容 ----------
+    if (method === 'GET' && p === '/api/backup/content') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const bk = backups[me.id];
+      if (!bk) return send(200, { content: '暂无备份内容。账号信息会在每次登录时自动备份到云端。' });
+      return send(200, {
+        content: '备份时间：' + bk.lastAt + '\n\n手机号：' + bk.phone + '\n编号：' + bk.authorNo + '\n昵称：' + bk.nickname + '\n会员：' + bk.vipTag + '\n收藏：' + bk.favCount + ' 项\n上传文件：' + bk.upCount + ' 个\n主题设置：已备份',
+      });
+    }
+
+    // ---------- 检查更新（远程管理：作者配置 data/update.json） ----------
+    if (method === 'GET' && p === '/api/checkUpdate') {
+      const upd = updateCfg || {};
+      const hasUpdate = !!upd.version && upd.version !== '1.2.17' && upd.version !== '1.2.18';
+      return send(200, { ok: true, hasUpdate, version: upd.version || '', log: upd.log || '', link: upd.link || '', notice: upd.notice || '' });
+    }
+
+    // ---------- 绑定账号：我的绑定码（用作者编号作绑定码） ----------
+    if (method === 'GET' && p === '/api/bind/mycode') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      return send(200, { ok: true, bindCode: me.authorNo, qr: 'resourcehub://bind?code=' + me.authorNo });
+    }
+
+    // ---------- 绑定账号：扫码绑定（互相绑定） ----------
+    if (method === 'POST' && p === '/api/bind/scan') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      let code = String(body.code || '').trim();
+      if (code.includes('bind?code=')) code = code.substring(code.indexOf('bind?code=') + 10);
+      code = code.split(/[^0-9A-Za-z]/)[0];
+      if (!code) return send(400, { error: '未识别到有效的绑定码' });
+      if (code === me.authorNo) return send(400, { error: '不能绑定自己' });
+      const friend = users.find((u) => u.authorNo === code);
+      if (!friend) return send(404, { error: '未找到该编号对应的账号' });
+      me.binds = me.binds || [];
+      friend.binds = friend.binds || [];
+      if (!me.binds.includes(friend.id)) me.binds.push(friend.id);
+      if (!friend.binds.includes(me.id)) friend.binds.push(me.id);
+      persistAll();
+      return send(200, { ok: true, message: '已与「' + (friend.nickname || friend.authorNo) + '」互相绑定账号', friend: { authorNo: friend.authorNo, nickname: friend.nickname } });
+    }
+
+    // ---------- 绑定账号：我的绑定列表 ----------
+    if (method === 'GET' && p === '/api/bind/list') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const ids = me.binds || [];
+      const list = users.filter((u) => ids.includes(u.id)).map((u) => ({ authorNo: u.authorNo, nickname: u.nickname || ('用户' + u.authorNo) }));
+      return send(200, { ok: true, list });
     }
 
     // ---------- 注册 ----------
@@ -492,6 +1057,49 @@ const server = http.createServer(async (req, res) => {
       if (!user) return send(404, { error: '账号不存在，请先注册' });
       if (!user.passwordHash) return send(403, { error: '该账号是微信/QQ快速登录账号，请使用「快速登录」进入' });
       if (user.passwordHash !== hashPwd(password, user.salt)) return send(401, { error: '密码错误' });
+      autoBackup(user); // 登录成功 → 自动备份账号数据
+      return send(200, { token: signToken(user.id), user: publicUser(user), authorNo: user.authorNo });
+    }
+
+    // ---------- QQ 邮箱验证码登录：发送验证码到 QQ 邮箱 ----------
+    if (method === 'POST' && p === '/api/qmail/code') {
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const email = String(body.email || '').trim().toLowerCase();
+      if (!/^[\w.+-]+@(qq|foxmail)\.com$/.test(email)) return send(400, { error: '请输入 QQ 邮箱（如 123456@qq.com）' });
+      const code = String(crypto.randomInt(100000, 999999));
+      emailCodes.set(email, { code, exp: Date.now() + 5 * 60 * 1000 });
+      try {
+        await smtpSend(email, '资源上传平台 - 登录验证码',
+          '<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;background:#f7f8fa;border-radius:12px">' +
+          '<h2 style="color:#1677ff;margin:0 0 12px">资源上传平台 · 登录验证码</h2>' +
+          '<p style="color:#333;line-height:1.7">你的登录验证码是：</p>' +
+          '<p style="font-size:34px;font-weight:800;letter-spacing:8px;color:#1677ff;margin:14px 0">' + code + '</p>' +
+          '<p style="color:#888;font-size:12px;line-height:1.6">验证码 5 分钟内有效，请勿泄露给他人。<br>如非本人操作，请忽略本邮件。</p></div>');
+        return send(200, { ok: true, message: '验证码已发送到 ' + email, expireSec: 300 });
+      } catch (e) {
+        emailCodes.delete(email);
+        return send(500, { error: e.message });
+      }
+    }
+    // ---------- QQ 邮箱验证码登录：校验验证码并登录（不存在则自动注册） ----------
+    if (method === 'POST' && p === '/api/qmail/login') {
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const email = String(body.email || '').trim().toLowerCase();
+      const code = String(body.code || '').trim();
+      const s = emailCodes.get(email);
+      if (!s || Date.now() > s.exp) return send(400, { error: '验证码不存在或已过期，请重新获取' });
+      if (s.code !== code) return send(401, { error: '验证码不正确' });
+      emailCodes.delete(email);
+      let user = users.find((u) => u.email === email);
+      if (!user) {
+        user = ensureVipFields({
+          id: uid(), phone: '', email, salt: '', passwordHash: '',
+          nickname: email.split('@')[0] + '用户', authorNo: nextAuthorNo(), avatar: '',
+          qqOpenid: 'qmail-' + email, createdAt: new Date().toISOString(),
+        });
+        users.push(user);
+      }
+      persistAll();
       return send(200, { token: signToken(user.id), user: publicUser(user), authorNo: user.authorNo });
     }
 
@@ -586,10 +1194,20 @@ const server = http.createServer(async (req, res) => {
         user: publicUser(user),
         todayUploaded: todayCount(user.id), uploadLeft: Math.max(0, left), dailyLimit: limit,
         isVip: isVip(user), vipUntil: vipExpireAt(user), vipPlan: isVip(user) ? (user.vipPlan || 'pro') : '',
+        vipTag: user.vipTag || (isVip(user) ? (user.vipPlan === 'pro' ? '高级VIP' : '基础VIP') : ''),
         todaySigned: user.lastSignin === today(),
         couponCount: unusedCoupons(user).length,
         coupons: unusedCoupons(user).map((c) => ({ id: c.id, createdAt: c.createdAt })),
         storageUsed: storageUsed(user.id), storageQuota: quotaFor(user),
+        quotaText: isAuthor(user) ? '不限' : fmtSize(quotaFor(user)),
+        dailyText: isAuthor(user) ? '不限' : String(dailyLimitFor(user)),
+        groupUnread: (() => {
+          const lastTs = groupMsgs.length ? groupMsgs[groupMsgs.length - 1].createdAt : '';
+          const readAt = user.groupReadAt || '';
+          if (!lastTs) return 0;
+          if (!readAt) return Math.min(groupMsgs.length, 99);
+          return lastTs > readAt ? Math.min(groupMsgs.filter((m) => m.createdAt > readAt).length, 99) : 0;
+        })(),
       });
     }
 
@@ -886,8 +1504,9 @@ const server = http.createServer(async (req, res) => {
       const rawName = Buffer.from(req.headers['x-file-name'] || '', 'base64').toString('utf8');
       const fileName = path.basename(rawName || 'unnamed');
       const declaredSize = parseInt(req.headers['x-file-size'] || '0', 10);
-      if (declaredSize > MAX_FILE_SIZE) return send(413, { error: '文件超过 200MB 上传限制' });
+      if (declaredSize > MAX_FILE_SIZE) return send(413, { error: '文件超过 2GB 上传上限，如需更大请先开通会员' });
       if (declaredSize > 0 && storageUsed(user.id) + declaredSize > quotaFor(user)) {
+        if (isAuthor(user)) return send(429, { error: '云盘空间不足' });
         return send(429, { error: `云盘空间不足：已用 ${fmtSize(storageUsed(user.id))} / ${fmtSize(quotaFor(user))}。免费云盘 1GB，开通「小善专属VIP」可扩容：基础 5 元/30 天=5GB，高级 10 元/30 天=100GB，节假日享优惠价` });
       }
       const buffer = await readBody(req, MAX_FILE_SIZE + (1 << 20));
@@ -997,6 +1616,104 @@ const server = http.createServer(async (req, res) => {
       msg.read = true;
       saveJson(messagesFile, messages);
       return send(200, { ok: true });
+    }
+
+    // ---------- 公共群聊（全部注册用户都在「资源上传平台 · 官方群」） ----------
+    // 发群消息：{ "content": "大家好" }
+    if (method === 'POST' && p === '/api/group/send') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const content = String(body.content || '').trim();
+      if (!content || content.length > 500) return send(400, { error: '群消息内容需 1-500 字' });
+      // 基础内容安全过滤（违法/攻击性内容直接拦截）
+      const BAD_WORDS = ['卖身','裸聊','一夜情','赌博网','博彩','六合彩','毒品','冰毒','海洛因','枪支','炸药','杀人','绑架','炸弹','恐怖袭击','黑客攻击','钓鱼网站'];
+      const hit = BAD_WORDS.find((w) => content.includes(w));
+      if (hit) return send(400, { error: '群消息包含违规内容（' + hit + '），已拦截' });
+      const gm = {
+        id: uid(8),
+        authorId: me.id,
+        authorNo: me.authorNo,
+        authorName: me.nickname || ('#' + me.authorNo),
+        content,
+        createdAt: new Date().toISOString(),
+      };
+      groupMsgs.push(gm);
+      if (groupMsgs.length > 500) groupMsgs = groupMsgs.slice(-500); // 最多保留 500 条
+      saveJson(groupFile, groupMsgs);
+      return send(200, { ok: true, message: '已发送到群', id: gm.id });
+    }
+    // 拉取群消息（after=上次最后一条时间，增量拉取，最多 100 条）
+    if (method === 'GET' && p === '/api/group/messages') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const qs = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
+      const after = qs.get('after') || '';
+      let list = groupMsgs;
+      if (after) list = list.filter((m) => m.createdAt > after);
+      list = list.slice(-100);
+      // 计算群未读：最后一条群消息时间晚于本用户已读时间戳的消息数
+      const lastTs = groupMsgs.length ? groupMsgs[groupMsgs.length - 1].createdAt : '';
+      const readAt = me.groupReadAt || '';
+      const unread = readAt && lastTs > readAt ? groupMsgs.filter((m) => m.createdAt > readAt).length : (readAt ? 0 : groupMsgs.length);
+      return send(200, { ok: true, messages: list, unread: Math.min(unread, 99), groupName: '资源上传平台 · 官方群' });
+    }
+    // 群已读（进入群聊页时调用）
+    if (method === 'POST' && p === '/api/group/read') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      me.groupReadAt = new Date().toISOString();
+      saveJson(usersFile, users);
+      return send(200, { ok: true });
+    }
+
+    // ---------- 多群系统：创建群 / 我的群 / 按编号加入 / 群主按编号加朋友 ----------
+    // 创建群：{ "name":"我的群", "groupNo":"8888" }
+    if (method === 'POST' && p === '/api/groups/create') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const name = String(body.name || '').trim();
+      const groupNo = String(body.groupNo || '').trim();
+      if (!name || !groupNo) return send(400, { error: '群名和群编号不能为空' });
+      if (name.length > 20 || groupNo.length > 20) return send(400, { error: '群名/编号最多 20 字' });
+      if (groups.some((g) => g.groupNo === groupNo)) return send(400, { error: '该群编号已被使用' });
+      const g = { id: uid(8), name, groupNo, owner: me.authorNo, members: [me.authorNo], createdAt: new Date().toISOString() };
+      groups.push(g);
+      saveJson(groupsFile, groups);
+      return send(200, { ok: true, group: g, message: '群创建成功' });
+    }
+    // 我的群（我创建或加入的群）
+    if (method === 'GET' && p === '/api/groups/mine') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const mine = groups.filter((g) => (g.members || []).includes(me.authorNo) || g.owner === me.authorNo);
+      return send(200, { ok: true, groups: mine });
+    }
+    // 按群编号加入群：{ "groupNo":"8888" }
+    if (method === 'POST' && p === '/api/groups/join') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const groupNo = String(body.groupNo || '').trim();
+      const g = groups.find((x) => x.groupNo === groupNo);
+      if (!g) return send(404, { error: '群编号不存在' });
+      if (!(g.members || []).includes(me.authorNo)) { g.members.push(me.authorNo); saveJson(groupsFile, groups); }
+      return send(200, { ok: true, group: g, message: '已加入群' });
+    }
+    // 群主按朋友编号加进群：{ "groupId":"...", "authorNo":"123" }
+    if (method === 'POST' && p === '/api/groups/addmember') {
+      const me = getAuth();
+      if (!me) return send(401, { error: '请先登录' });
+      const body = JSON.parse((await readBody(req, 1 << 20)).toString('utf8') || '{}');
+      const gid = String(body.groupId || '').trim();
+      const memberNo = String(body.authorNo || '').trim();
+      const g = groups.find((x) => x.id === gid);
+      if (!g) return send(404, { error: '群不存在' });
+      if (g.owner !== me.authorNo) return send(403, { error: '只有群主可以添加成员' });
+      if (!memberNo) return send(400, { error: '请输入成员编号' });
+      if (!(g.members || []).includes(memberNo)) { g.members.push(memberNo); saveJson(groupsFile, groups); }
+      return send(200, { ok: true, members: g.members, message: '已添加成员 #' + memberNo });
     }
 
     // ---------- 公开链接下载页（英文字母链接，浏览器直接打开，真实有效） ----------
